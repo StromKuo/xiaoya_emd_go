@@ -1,0 +1,23 @@
+services:
+  # 该服务应与已有的 xiaoya 服务加入同一个 Docker 网络。
+  xiaoya-emd-go:
+    image: ghcr.io/your-github-owner/xiaoya-emd-go:sha-<commit>
+    container_name: xiaoya-emd-go
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      # 签名接口由可信的启动环境配置，Web UI/API 不可修改。
+      # - XIAOYA_STRM_SIGN_ENDPOINT=http://xiaoya/api/getsignmd5
+      # 该文件优先于 strmSignToken 配置，并在每次刷新签名时重新读取。
+      # - XIAOYA_STRM_TOKEN_FILE=/run/secrets/xiaoya_alist_token
+    volumes:
+      - /your/media/path:/media
+      # - /mnt/user/appdata/xiaoya/data/alist_auth_token.txt:/run/secrets/xiaoya_alist_token:ro
+    networks:
+      - xiaoya
+
+networks:
+  # 若已有 Compose 项目使用默认网络，请把该网络名替换为实际网络名。
+  xiaoya:
+    external: true

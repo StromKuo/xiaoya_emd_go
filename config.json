@@ -54,5 +54,10 @@
     "综艺/": 26156,
     "音乐/": 1889,
     "📺画质演示测试（4K，8K，HDR，Dolby）/": 1933
-  }
+  },
+  "strmRewriteEnabled": false,
+  "strmBaseUrl": "",
+  "strmSignEndpoint": "http://xiaoya/api/getsignmd5",
+  "strmSignToken": "",
+  "strmSourceHosts": []
 }

@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -41,23 +42,32 @@ const (
 
 // Config 定义程序的配置文件结构
 type Config struct {
-	SPathsAll             []string        `json:"sPathsAll"`
-	SPool                 []string        `json:"sPool"`
-	ActivePaths           []string        `json:"activePaths"`
-	Interval              int             `json:"interval"`
-	ScanListTime          time.Time       `json:"scanListTime"`
-	DNSType               DNSType         `json:"dnsType"`
-	DNSServer             string          `json:"dnsServer"`
-	DNSEnabled            bool            `json:"dnsEnabled"`
-	LogSize               int             `json:"logSize"`
-	BandwidthLimitEnabled bool            `json:"bandwidthLimitEnabled"`
-	BandwidthLimitMBps    float64         `json:"bandwidthLimitMBps"`
-	MaxConcurrency        int             `json:"maxConcurrency"`
-	PathUpdateNotices     map[string]bool `json:"pathUpdateNotices"`
-	ServerPathCounts      map[string]int  `json:"serverPathCounts"`
-	LocalPathCounts       map[string]int  `json:"localPathCounts"`
-	MemoryLimitEnabled    bool            `json:"memoryLimitEnabled"` //内存限制开关
-	MemoryLimitMB         float64         `json:"memoryLimitMB"`      //内存限制（MB）
+	SPathsAll                  []string        `json:"sPathsAll"`
+	SPool                      []string        `json:"sPool"`
+	ActivePaths                []string        `json:"activePaths"`
+	Interval                   int             `json:"interval"`
+	ScanListTime               time.Time       `json:"scanListTime"`
+	DNSType                    DNSType         `json:"dnsType"`
+	DNSServer                  string          `json:"dnsServer"`
+	DNSEnabled                 bool            `json:"dnsEnabled"`
+	LogSize                    int             `json:"logSize"`
+	BandwidthLimitEnabled      bool            `json:"bandwidthLimitEnabled"`
+	BandwidthLimitMBps         float64         `json:"bandwidthLimitMBps"`
+	MaxConcurrency             int             `json:"maxConcurrency"`
+	PathUpdateNotices          map[string]bool `json:"pathUpdateNotices"`
+	ServerPathCounts           map[string]int  `json:"serverPathCounts"`
+	LocalPathCounts            map[string]int  `json:"localPathCounts"`
+	MemoryLimitEnabled         bool            `json:"memoryLimitEnabled"` //内存限制开关
+	MemoryLimitMB              float64         `json:"memoryLimitMB"`      //内存限制（MB）
+	StrmRewriteEnabled         bool            `json:"strmRewriteEnabled"`
+	StrmBaseURL                string          `json:"strmBaseUrl"`
+	StrmSignEndpoint           string          `json:"strmSignEndpoint"`
+	StrmSignToken              string          `json:"strmSignToken"`
+	StrmSourceHosts            []string        `json:"strmSourceHosts"`
+	StrmLastAppliedSign        string          `json:"strmLastAppliedSign,omitempty"`
+	StrmLastAppliedFingerprint string          `json:"strmLastAppliedFingerprint,omitempty"`
+	StrmPendingRetryPaths      []string        `json:"strmPendingRetryPaths,omitempty"`
+	StrmPendingRetryOverflow   bool            `json:"strmPendingRetryOverflow,omitempty"`
 }
 
 // LogEntry 定义日志条目结构
@@ -104,12 +114,15 @@ type ServerFileInfo struct {
 
 // 全局变量
 var (
-	config     Config
-	configMu   sync.RWMutex
-	httpClient *http.Client
-	logs       *ring.Ring
-	logsMu     sync.Mutex
-	syncState  = SyncState{
+	config               Config
+	configMu             sync.RWMutex
+	configSaveMu         sync.Mutex
+	strmConfigMu         sync.Mutex
+	strmConfigGeneration uint64
+	httpClient           *http.Client
+	logs                 *ring.Ring
+	logsMu               sync.Mutex
+	syncState            = SyncState{
 		Running:  true,
 		Trigger:  make(chan struct{}, 1),
 		SyncDone: make(chan struct{}),
@@ -121,11 +134,64 @@ var (
 	intervalChange = make(chan int, 1) // interval 变更通道
 )
 
+// notifyIntervalChange 只保留最新的同步间隔，避免同步任务运行期间旧通知阻塞新配置。
+func notifyIntervalChange(newInterval int) {
+	select {
+	case intervalChange <- newInterval:
+	default:
+		select {
+		case <-intervalChange:
+		default:
+		}
+		select {
+		case intervalChange <- newInterval:
+		default:
+		}
+	}
+}
+
 // CustomResolver 自定义 DNS 解析器
 type CustomResolver struct {
 	Type       DNSType
 	Server     string
 	HTTPClient *http.Client
+}
+
+type logBufferSnapshot struct {
+	size    int
+	entries []LogEntry
+}
+
+func snapshotLogBuffer(size int) logBufferSnapshot {
+	snapshot := logBufferSnapshot{size: size}
+	if size <= 0 {
+		return snapshot
+	}
+	logsMu.Lock()
+	defer logsMu.Unlock()
+	if logs == nil {
+		return snapshot
+	}
+	logs.Do(func(value interface{}) {
+		if entry, ok := value.(LogEntry); ok {
+			snapshot.entries = append(snapshot.entries, entry)
+		}
+	})
+	return snapshot
+}
+
+func restoreLogBuffer(snapshot logBufferSnapshot) {
+	if snapshot.size <= 0 {
+		return
+	}
+	restored := ring.New(snapshot.size)
+	for _, entry := range snapshot.entries {
+		restored.Value = entry
+		restored = restored.Next()
+	}
+	logsMu.Lock()
+	logs = restored
+	logsMu.Unlock()
 }
 
 // formatTime 将时间格式化为东八区
@@ -409,9 +475,13 @@ func getLogs(limit, page int, filter, search string) ([]LogEntry, int) {
 	logsMu.Lock()
 	defer logsMu.Unlock()
 
-	allLogs := make([]LogEntry, 0, config.LogSize)
+	if logs == nil {
+		return []LogEntry{}, 0
+	}
+	logSize := logs.Len()
+	allLogs := make([]LogEntry, 0, logSize)
 	r := logs
-	for i := 0; i < config.LogSize; i++ {
+	for i := 0; i < logSize; i++ {
 		if r.Value != nil {
 			allLogs = append(allLogs, r.Value.(LogEntry))
 		}
@@ -489,6 +559,9 @@ func loadConfig() error {
 			if err := json.NewDecoder(rootConfigFile).Decode(&rootConfig); err != nil {
 				return fmt.Errorf("解析根目录配置文件 %s 失败：%v", rootConfigPath, err)
 			}
+			if err := applyStrmConfigDefaults(&rootConfig); err != nil {
+				return fmt.Errorf("根目录 STRM 配置无效：%v", err)
+			}
 			// 初始化 LocalPathCounts
 			if rootConfig.LocalPathCounts == nil {
 				rootConfig.LocalPathCounts = make(map[string]int)
@@ -496,13 +569,14 @@ func loadConfig() error {
 			// 保存到 mediaDir
 			configMu.Lock()
 			config = rootConfig
+			strmConfigGeneration++
 			configMu.Unlock()
+			strmSignCache.Invalidate()
 			addLog("info", fmt.Sprintf("配置文件 %s 未找到，从根目录 %s 拷贝默认配置", configFilePath, rootConfigPath))
 			return saveConfig()
 		}
 		// 根目录也没有 config.json，创建默认配置
-		configMu.Lock()
-		config = Config{
+		defaultConfig := Config{
 			Interval:              1,
 			DNSType:               DNSTypeDoH,
 			DNSServer:             "https://1.1.1.1/dns-query",
@@ -516,7 +590,18 @@ func loadConfig() error {
 			LocalPathCounts:       make(map[string]int), // 初始化 LocalPathCounts
 			MemoryLimitEnabled:    false,                // 默认关闭内存限制
 			MemoryLimitMB:         512.0,                // 默认 512MB
+			StrmRewriteEnabled:    false,
+			StrmBaseURL:           "",
+			StrmSignEndpoint:      defaultStrmSignEndpoint,
+			StrmSignToken:         "",
+			StrmSourceHosts:       []string{},
 		}
+		if err := applyStrmConfigDefaults(&defaultConfig); err != nil {
+			return fmt.Errorf("默认 STRM 配置无效：%v", err)
+		}
+		configMu.Lock()
+		config = defaultConfig
+		strmConfigGeneration++
 		configMu.Unlock()
 		addLog("info", fmt.Sprintf("配置文件 %s 和根目录配置文件均未找到，已创建默认配置", configFilePath))
 		return saveConfig()
@@ -553,6 +638,9 @@ func loadConfig() error {
 	if !newConfig.MemoryLimitEnabled {
 		newConfig.MemoryLimitEnabled = false
 	}
+	if err := applyStrmConfigDefaults(&newConfig); err != nil {
+		return fmt.Errorf("STRM 配置无效：%v", err)
+	}
 
 	logsMu.Lock()
 	currentSize := logs.Len()
@@ -574,24 +662,66 @@ func loadConfig() error {
 
 	configMu.Lock()
 	config = newConfig
+	strmConfigGeneration++
 	configMu.Unlock()
+	strmSignCache.Invalidate()
 
 	addLog("info", "配置文件加载成功")
 	return nil
 }
 
-// saveConfig 保存配置到 config.json
+// saveConfig 保存配置到 config.json。先在读锁内复制配置，避免编码期间与
+// 配置更新并发访问 map/slice；configSaveMu 保证多个快照串行落盘。
 func saveConfig() error {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	return saveConfigSnapshot(cloneConfig(config))
+}
+
+// saveConfigLocked 在持有 configMu 写锁时调用。
+func saveConfigLocked() error {
+	return saveConfigSnapshot(cloneConfig(config))
+}
+
+func saveConfigSnapshot(snapshot Config) error {
+	configSaveMu.Lock()
+	defer configSaveMu.Unlock()
+
 	mediaDir := flag.Lookup("media").Value.String()
 	configFilePath := filepath.Join(mediaDir, "config.json")
-	configFile, err := os.Create(configFilePath)
+	tempFile, err := os.CreateTemp(mediaDir, ".config.json-*")
 	if err != nil {
 		return err
 	}
-	defer configFile.Close()
-	encoder := json.NewEncoder(configFile)
+	tempPath := tempFile.Name()
+	removeTemp := true
+	defer func() {
+		if removeTemp {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if err := tempFile.Chmod(0600); err != nil {
+		_ = tempFile.Close()
+		return err
+	}
+	encoder := json.NewEncoder(tempFile)
 	encoder.SetIndent("", "  ")
-	return encoder.Encode(config)
+	if err := encoder.Encode(snapshot); err != nil {
+		_ = tempFile.Close()
+		return err
+	}
+	if err := tempFile.Sync(); err != nil {
+		_ = tempFile.Close()
+		return err
+	}
+	if err := tempFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, configFilePath); err != nil {
+		return err
+	}
+	removeTemp = false
+	return nil
 }
 
 // cleanFileName 清理文件名中的非法字符
@@ -764,7 +894,7 @@ func handleRefreshLocal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := saveConfig(); err != nil {
+	if err := saveConfigLocked(); err != nil {
 		configMu.Unlock()
 		addLog("error", fmt.Sprintf("保存配置文件失败：%v", err))
 		http.Error(w, "保存配置文件失败", http.StatusInternalServerError)
@@ -807,6 +937,9 @@ func scanLocalFilesToMap(mediaDir string, paths []string) (*LocalFileInfo, error
 			err := filepath.Walk(dirPath, func(filePath string, info os.FileInfo, err error) error {
 				if err != nil || info.IsDir() {
 					return err
+				}
+				if isStrmRewriteTempFile(filePath) {
+					return nil
 				}
 
 				relativePath, _ := filepath.Rel(mediaDir, filePath)
@@ -916,7 +1049,7 @@ func compareAndPrepareSync(localMap FileInfoMap, serverInfo *ServerFileInfo, pat
 	for k, v := range pathNotice {
 		config.PathUpdateNotices[k] = v
 	}
-	saveConfig()
+	saveConfigLocked()
 	configMu.Unlock()
 
 	addLog("info", fmt.Sprintf("内存对比完成：需更新 %d 个文件，需删除 %d 个文件",
@@ -927,6 +1060,10 @@ func compareAndPrepareSync(localMap FileInfoMap, serverInfo *ServerFileInfo, pat
 // 修改后的 downloadFile 函数，支持上下文取消
 func downloadFile(ctx context.Context, file FileInfo, servers []ServerInfo, media, cleanedPath string) error {
 	localPath := filepath.Join(media, cleanedPath)
+	if strings.EqualFold(filepath.Ext(localPath), ".strm") {
+		strmSyncGate.RLock()
+		defer strmSyncGate.RUnlock()
+	}
 	if err := os.MkdirAll(filepath.Dir(localPath), 0777); err != nil {
 		return fmt.Errorf("创建目录失败：%v", err)
 	}
@@ -977,15 +1114,40 @@ func downloadFile(ctx context.Context, file FileInfo, servers []ServerInfo, medi
 				os.Remove(localPath + ".tmp")
 				return fmt.Errorf("写入文件 %s 失败：%v", localPath, err)
 			}
+			configMu.RLock()
+			strmRewriteEnabled := config.StrmRewriteEnabled
+			strmBaseURL := config.StrmBaseURL
+			strmSignEndpoint := config.StrmSignEndpoint
+			strmSignToken := config.StrmSignToken
+			strmSourceHosts := append([]string(nil), config.StrmSourceHosts...)
+			configMu.RUnlock()
+			if strmRewriteEnabled && strings.EqualFold(filepath.Ext(localPath), ".strm") {
+				refreshed, usedStale, err := rewriteDownloadedSTRM(ctx, localPath+".tmp", strmBaseURL, strmSignEndpoint, strmSignToken, strmSourceHosts)
+				if err != nil {
+					os.Remove(localPath + ".tmp")
+					if errors.Is(err, errStrmSignFetch) {
+						addLog("error", "STRM 签名获取失败")
+					} else {
+						addLog("error", "STRM 重写失败")
+					}
+					return fmt.Errorf("STRM 重写失败")
+				}
+				if refreshed {
+					addLog("success", "STRM 签名获取成功")
+				}
+				if usedStale {
+					addLog("warning", "STRM 签名刷新失败，使用短期缓存")
+				}
+			}
+			modTime := time.Unix(file.Timestamp, 0)
+			if err := os.Chtimes(localPath+".tmp", modTime, modTime); err != nil {
+				addLog("error", fmt.Sprintf("设置文件 %s 的时间戳失败：%v", localPath, err))
+				os.Remove(localPath + ".tmp")
+				return err
+			}
 			if err := os.Rename(localPath+".tmp", localPath); err != nil {
 				os.Remove(localPath + ".tmp")
 				return fmt.Errorf("重命名文件 %s 失败：%v", localPath, err)
-			}
-			modTime := time.Unix(file.Timestamp, 0)
-			if err := os.Chtimes(localPath, modTime, modTime); err != nil {
-				addLog("error", fmt.Sprintf("设置文件 %s 的时间戳失败：%v", localPath, err))
-				os.Remove(localPath)
-				return err
 			}
 			if i == 0 {
 				addLog("success", fmt.Sprintf("下载完成：%s", file.Path))
@@ -1001,6 +1163,10 @@ func downloadFile(ctx context.Context, file FileInfo, servers []ServerInfo, medi
 // deleteLocalFile 删除本地文件，移动到回收站
 func deleteLocalFile(mediaDir, path string) error {
 	localPath := filepath.Join(mediaDir, path)
+	if strings.EqualFold(filepath.Ext(localPath), ".strm") {
+		strmSyncGate.RLock()
+		defer strmSyncGate.RUnlock()
+	}
 	recycleDir := filepath.Join(mediaDir, "recycle_bin")
 	recyclePath := filepath.Join(recycleDir, path)
 
@@ -1051,11 +1217,8 @@ func testMediaFolder(media string, paths []string) bool {
 
 // syncFiles 执行文件同步逻辑
 func syncFiles(media *string) {
-	if err := loadConfig(); err != nil {
-		addLog("error", fmt.Sprintf("初始加载配置文件失败：%v", err))
-		return
-	}
-	intervalChange := make(chan int, 1)
+	// main 在启动后台同步前已经完成配置加载。这里不能再次读取配置，
+	// 否则会与签名监测/历史修复并发覆盖刚持久化的 STRM 应用状态。
 	restartTicker := func(ticker *time.Ticker, interval int) *time.Ticker {
 		if ticker != nil {
 			ticker.Stop()
@@ -1079,6 +1242,16 @@ func syncFiles(media *string) {
 	}
 	ticker := time.NewTicker(time.Duration(interval) * time.Hour)
 	defer ticker.Stop()
+	applyIntervalChange := func(newInterval int) {
+		configMu.RLock()
+		newInterval = config.Interval
+		configMu.RUnlock()
+		if newInterval <= 0 {
+			return
+		}
+		interval = newInterval
+		ticker = restartTicker(ticker, newInterval)
+	}
 	mediaDir := filepath.Clean(*media)
 	scanListGzPath := ".scan.list.gz"
 
@@ -1102,10 +1275,7 @@ func syncFiles(media *string) {
 				addLog("info", "主同步任务暂停，等待触发")
 				continue
 			case newInterval := <-intervalChange:
-				configMu.Lock()
-				config.Interval = newInterval
-				configMu.Unlock()
-				ticker = restartTicker(ticker, newInterval)
+				applyIntervalChange(newInterval)
 				continue
 			case <-ticker.C:
 				syncStateMu.Lock()
@@ -1169,6 +1339,9 @@ func syncFiles(media *string) {
 		if len(servers) == 0 {
 			addLog("error", "没有可用的服务器，等待 5 分钟后重试")
 			select {
+			case newInterval := <-intervalChange:
+				applyIntervalChange(newInterval)
+				continue
 			case <-time.After(5 * time.Minute):
 				continue
 			case <-syncState.SyncDone:
@@ -1212,6 +1385,9 @@ func syncFiles(media *string) {
 					syncStateMu.Unlock()
 					addLog("info", "主同步任务暂停，等待触发")
 					continue
+				case newInterval := <-intervalChange:
+					applyIntervalChange(newInterval)
+					continue
 				case <-time.After(time.Duration(interval) * time.Hour):
 					addLog("warning", "同步超时，强制进入下一次循环")
 				}
@@ -1239,7 +1415,7 @@ func syncFiles(media *string) {
 				delete(config.ServerPathCounts, path)
 			}
 		}
-		if err := saveConfig(); err != nil {
+		if err := saveConfigLocked(); err != nil {
 			addLog("error", fmt.Sprintf("保存服务器路径计数失败：%v", err))
 		}
 		configMu.Unlock()
@@ -1272,6 +1448,9 @@ func syncFiles(media *string) {
 
 		// 增量更新本地路径计数
 		updateLocalPathCounts(pathCountChanges, paths)
+		if err == nil && len(failedFiles) > 0 {
+			err = fmt.Errorf("部分文件同步失败：%d 个", len(failedFiles))
+		}
 
 		// 处理同步结果
 		syncStateMu.Lock()
@@ -1291,19 +1470,12 @@ func syncFiles(media *string) {
 			continue
 		}
 
-		// 更新 scanListTime
-		configMu.Lock()
-		config.ScanListTime = serverTime
-		if err := saveConfig(); err != nil {
-			addLog("error", fmt.Sprintf("更新配置文件时间失败：%v", err))
-		}
-		configMu.Unlock()
-
-		addLog("info", fmt.Sprintf("本地数据日期 为 %s", formatTime(serverTime)))
-
 		if err != nil {
 			addLog("error", fmt.Sprintf("核心同步失败：%v", err))
 			select {
+			case newInterval := <-intervalChange:
+				applyIntervalChange(newInterval)
+				continue
 			case <-time.After(5 * time.Minute):
 				continue
 			case <-syncState.SyncDone:
@@ -1314,6 +1486,16 @@ func syncFiles(media *string) {
 				continue
 			}
 		}
+
+		// 仅在本轮全部成功后推进 scanListTime；失败文件必须在下一轮重试。
+		configMu.Lock()
+		config.ScanListTime = serverTime
+		if err := saveConfigLocked(); err != nil {
+			addLog("error", fmt.Sprintf("更新配置文件时间失败：%v", err))
+		}
+		configMu.Unlock()
+
+		addLog("info", fmt.Sprintf("本地数据日期 为 %s", formatTime(serverTime)))
 
 		if running {
 			if len(failedFiles) > 0 {
@@ -1337,6 +1519,9 @@ func syncFiles(media *string) {
 
 		// 等待下一轮同步
 		select {
+		case newInterval := <-intervalChange:
+			applyIntervalChange(newInterval)
+			continue
 		case <-syncState.Trigger:
 			addLog("info", "手动触发同步，立即开始新一轮同步")
 			continue
@@ -1395,7 +1580,7 @@ func updateLocalPathCounts(pathCountChanges map[string]int, paths []string) {
 
 	// 仅在计数发生变化时保存配置
 	if needSave {
-		if err := saveConfig(); err != nil {
+		if err := saveConfigLocked(); err != nil {
 			addLog("error", fmt.Sprintf("更新本地文件数量失败：%v", err))
 		} else {
 			addLog("info", "更新本地文件数量完成")
@@ -1662,19 +1847,102 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 		MaxConcurrency        *int      `json:"maxConcurrency,omitempty"`
 		MemoryLimitEnabled    *bool     `json:"memoryLimitEnabled,omitempty"` // 新增
 		MemoryLimitMB         *float64  `json:"memoryLimitMB,omitempty"`      // 新增
+		StrmRewriteEnabled    *bool     `json:"strmRewriteEnabled,omitempty"`
+		StrmBaseURL           *string   `json:"strmBaseUrl,omitempty"`
+		StrmSignEndpoint      *string   `json:"strmSignEndpoint,omitempty"`
+		StrmSignToken         *string   `json:"strmSignToken,omitempty"`
+		StrmSignTokenClear    *bool     `json:"strmSignTokenClear,omitempty"`
+		StrmSourceHosts       *[]string `json:"strmSourceHosts,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&newConfig); err != nil {
 		http.Error(w, "解析JSON数据失败", http.StatusBadRequest)
 		return
 	}
-	if newConfig.SPathsAll == nil && newConfig.SPool == nil && newConfig.ActivePaths == nil && newConfig.Interval == nil && newConfig.DNSType == nil && newConfig.DNSServer == nil && newConfig.DNSEnabled == nil && newConfig.LogSize == nil && newConfig.BandwidthLimitEnabled == nil && newConfig.BandwidthLimitMBps == nil && newConfig.MaxConcurrency == nil && newConfig.MemoryLimitEnabled == nil && newConfig.MemoryLimitMB == nil {
+	if newConfig.StrmSignEndpoint != nil {
+		http.Error(w, "STRM 签名接口只能通过启动环境变量或配置文件设置，不能由 Web API 修改", http.StatusBadRequest)
+		return
+	}
+	if newConfig.SPathsAll == nil && newConfig.SPool == nil && newConfig.ActivePaths == nil && newConfig.Interval == nil && newConfig.DNSType == nil && newConfig.DNSServer == nil && newConfig.DNSEnabled == nil && newConfig.LogSize == nil && newConfig.BandwidthLimitEnabled == nil && newConfig.BandwidthLimitMBps == nil && newConfig.MaxConcurrency == nil && newConfig.MemoryLimitEnabled == nil && newConfig.MemoryLimitMB == nil && newConfig.StrmRewriteEnabled == nil && newConfig.StrmBaseURL == nil && newConfig.StrmSignEndpoint == nil && newConfig.StrmSignToken == nil && newConfig.StrmSignTokenClear == nil && newConfig.StrmSourceHosts == nil {
 		http.Error(w, "至少需要提供一个配置字段", http.StatusBadRequest)
 		return
 	}
 
+	strmConfigChanged := newConfig.StrmRewriteEnabled != nil || newConfig.StrmBaseURL != nil || newConfig.StrmSignToken != nil || newConfig.StrmSignTokenClear != nil || newConfig.StrmSourceHosts != nil
+	var normalizedStrmBaseURL, normalizedStrmSignEndpoint string
+	var normalizedStrmSourceHosts []string
+	var normalizedStrmSignToken string
+	if strmConfigChanged {
+		strmConfigMu.Lock()
+		defer strmConfigMu.Unlock()
+		// 配置变更必须与历史 STRM 修复及 STRM 下载互斥。否则旧任务
+		// 可能在新配置写入后继续覆盖文件，且本次监测触发会被丢弃。
+		strmSyncGate.Lock()
+		defer strmSyncGate.Unlock()
+		configMu.RLock()
+		strmEnabled := config.StrmRewriteEnabled
+		strmBaseURL := config.StrmBaseURL
+		strmSignEndpoint := config.StrmSignEndpoint
+		strmSignToken := config.StrmSignToken
+		strmSourceHosts := append([]string(nil), config.StrmSourceHosts...)
+		configMu.RUnlock()
+		if strmSignEndpoint == "" {
+			strmSignEndpoint = defaultStrmSignEndpoint
+		}
+		if newConfig.StrmRewriteEnabled != nil {
+			strmEnabled = *newConfig.StrmRewriteEnabled
+		}
+		if newConfig.StrmBaseURL != nil {
+			strmBaseURL = *newConfig.StrmBaseURL
+		}
+		if newConfig.StrmSourceHosts != nil {
+			strmSourceHosts = append([]string(nil), (*newConfig.StrmSourceHosts)...)
+		}
+		if newConfig.StrmSignTokenClear != nil && *newConfig.StrmSignTokenClear {
+			if newConfig.StrmSignToken != nil && strings.TrimSpace(*newConfig.StrmSignToken) != "" {
+				http.Error(w, "不能同时设置并清除 STRM 签名 token", http.StatusBadRequest)
+				return
+			}
+			strmSignToken = ""
+		}
+		if newConfig.StrmSignToken != nil && strings.TrimSpace(*newConfig.StrmSignToken) != "" {
+			strmSignToken = strings.TrimSpace(*newConfig.StrmSignToken)
+		}
+		var err error
+		normalizedStrmBaseURL, normalizedStrmSignEndpoint, err = validateStrmConfig(strmEnabled, strmBaseURL, strmSignEndpoint)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		normalizedStrmSourceHosts, err = normalizeStrmSourceHosts(strmSourceHosts)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if strmEnabled {
+			if _, err := resolveStrmSignToken(strmSignToken); err != nil {
+				http.Error(w, "启用 STRM 重写时小雅签名 token 不能为空", http.StatusBadRequest)
+				return
+			}
+		}
+		if strmEnabled && len(normalizedStrmSourceHosts) == 0 {
+			http.Error(w, "启用 STRM 重写时至少需要配置一个来源主机", http.StatusBadRequest)
+			return
+		}
+		normalizedStrmSignToken = strings.TrimSpace(strmSignToken)
+	}
+
 	dnsChanged := false
 	bandwidthChanged := false
+	intervalChanged := false
+	newInterval := 0
 	configMu.Lock()
+	previousLogs := snapshotLogBuffer(config.LogSize)
+	previousConfig := cloneConfig(config)
+	rollbackConfig := func() {
+		config = previousConfig
+		restoreLogBuffer(previousLogs)
+		configMu.Unlock()
+	}
 	if newConfig.SPathsAll != nil {
 		config.SPathsAll = *newConfig.SPathsAll
 	}
@@ -1684,17 +1952,14 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if newConfig.Interval != nil {
 		if *newConfig.Interval <= 0 || *newConfig.Interval > 24 {
-			configMu.Unlock()
+			rollbackConfig()
 			http.Error(w, "同步间隔必须为 1-24 的正整数", http.StatusBadRequest)
 			return
 		}
 		config.Interval = *newConfig.Interval
+		intervalChanged = true
+		newInterval = *newConfig.Interval
 		addLog("info", fmt.Sprintf("同步间隔更新为 %d 小时", config.Interval))
-		select {
-		case intervalChange <- *newConfig.Interval:
-		default:
-			addLog("warning", "intervalChange 通道已满，ticker 可能未更新")
-		}
 	}
 	if newConfig.DNSType != nil || newConfig.DNSServer != nil || newConfig.DNSEnabled != nil {
 		dnsEnabled := config.DNSEnabled
@@ -1705,7 +1970,7 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 		if newConfig.DNSType != nil {
 			dnsType = *newConfig.DNSType
 			if dnsType != DNSTypeDoH && dnsType != DNSTypeDoT {
-				configMu.Unlock()
+				rollbackConfig()
 				http.Error(w, "DNS 类型必须为 'doh' 或 'dot'", http.StatusBadRequest)
 				return
 			}
@@ -1716,19 +1981,19 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if dnsEnabled {
 			if dnsServer == "" {
-				configMu.Unlock()
+				rollbackConfig()
 				http.Error(w, "DNS 服务器地址不能为空", http.StatusBadRequest)
 				return
 			}
 			if dnsType == DNSTypeDoH {
 				if !strings.HasPrefix(dnsServer, "http://") && !strings.HasPrefix(dnsServer, "https://") && !strings.Contains(dnsServer, "/dns-query") {
-					configMu.Unlock()
+					rollbackConfig()
 					http.Error(w, "DoH 服务器需以 http:// 或 https:// 开头，或包含 /dns-query", http.StatusBadRequest)
 					return
 				}
 			} else if dnsType == DNSTypeDoT {
 				if !regexp.MustCompile(`^[\w.-]+(:[0-9]+)?$`).MatchString(dnsServer) {
-					configMu.Unlock()
+					rollbackConfig()
 					http.Error(w, "DoT 服务器需为有效域名或 IP 地址，可选端口号（如 :853）", http.StatusBadRequest)
 					return
 				}
@@ -1741,7 +2006,7 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if newConfig.LogSize != nil {
 		if *newConfig.LogSize <= 0 {
-			configMu.Unlock()
+			rollbackConfig()
 			http.Error(w, "日志大小必须为正整数", http.StatusBadRequest)
 			return
 		}
@@ -1763,7 +2028,7 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if newConfig.BandwidthLimitMBps != nil {
 		if *newConfig.BandwidthLimitMBps <= 0 {
-			configMu.Unlock()
+			rollbackConfig()
 			http.Error(w, "带宽限制必须为正数", http.StatusBadRequest)
 			return
 		}
@@ -1773,7 +2038,7 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if newConfig.MaxConcurrency != nil {
 		if *newConfig.MaxConcurrency <= 0 {
-			configMu.Unlock()
+			rollbackConfig()
 			http.Error(w, "最大并发数必须为正整数", http.StatusBadRequest)
 			return
 		}
@@ -1786,25 +2051,54 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if newConfig.MemoryLimitMB != nil {
 		if *newConfig.MemoryLimitMB <= 0 {
-			configMu.Unlock()
+			rollbackConfig()
 			http.Error(w, "内存限制必须为正数", http.StatusBadRequest)
 			return
 		}
 		config.MemoryLimitMB = *newConfig.MemoryLimitMB
 		addLog("info", fmt.Sprintf("内存限制值更新为 %.2f MB", config.MemoryLimitMB))
 	}
+	if strmConfigChanged {
+		if newConfig.StrmRewriteEnabled != nil {
+			config.StrmRewriteEnabled = *newConfig.StrmRewriteEnabled
+		}
+		config.StrmBaseURL = normalizedStrmBaseURL
+		config.StrmSignEndpoint = normalizedStrmSignEndpoint
+		config.StrmSignToken = normalizedStrmSignToken
+		config.StrmSourceHosts = normalizedStrmSourceHosts
+		config.StrmLastAppliedSign = ""
+		config.StrmLastAppliedFingerprint = ""
+		config.StrmPendingRetryPaths = nil
+		config.StrmPendingRetryOverflow = false
+		addLog("info", fmt.Sprintf("STRM 重写已%s", map[bool]string{true: "启用", false: "关闭"}[config.StrmRewriteEnabled]))
+	}
+	if err := saveConfigLocked(); err != nil {
+		rollbackConfig()
+		http.Error(w, "保存配置文件失败", http.StatusInternalServerError)
+		return
+	}
+	if strmConfigChanged {
+		strmConfigGeneration++
+	}
 	configMu.Unlock()
 
+	if intervalChanged {
+		notifyIntervalChange(newInterval)
+	}
 	if dnsChanged || bandwidthChanged {
 		addLog("info", "网络配置已变更，开始重新初始化 HTTP 客户端")
 		initHttpClient()
 	}
-	if err := saveConfig(); err != nil {
-		http.Error(w, "保存配置文件失败", http.StatusInternalServerError)
-		return
+	if strmConfigChanged {
+		strmSignCache.Invalidate()
+		resetStrmSignMonitorRetry()
+		requestStrmSignMonitor()
 	}
+	configMu.RLock()
+	public := publicConfigResponse(config)
+	configMu.RUnlock()
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(config)
+	json.NewEncoder(w).Encode(public)
 }
 
 // handlePaths 返回所有路径和激活路径
@@ -1872,6 +2166,9 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 // handleLogs 返回最近的日志
 func handleLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	configMu.RLock()
+	logSize := config.LogSize
+	configMu.RUnlock()
 
 	limitStr := r.URL.Query().Get("limit")
 	pageStr := r.URL.Query().Get("page")
@@ -1883,8 +2180,8 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 	if limitStr != "" {
 		fmt.Sscanf(limitStr, "%d", &limit)
 	}
-	if limit <= 0 || limit > config.LogSize {
-		limit = config.LogSize
+	if limit <= 0 || limit > logSize {
+		limit = logSize
 	}
 
 	page := 1
@@ -1896,13 +2193,13 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if action == "export" {
-		logs, _ := getLogs(config.LogSize, 1, "", "")
+		logs, _ := getLogs(logSize, 1, "", "")
 		w.Header().Set("Content-Disposition", "attachment; filename=logs.json")
 		json.NewEncoder(w).Encode(logs)
 		return
 	} else if action == "clear" {
 		logsMu.Lock()
-		logs = ring.New(config.LogSize)
+		logs = ring.New(logSize)
 		logsMu.Unlock()
 		addLog("info", "日志已清空")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -1911,7 +2208,7 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 
 	logsData, total := getLogs(limit, page, filter, search)
 
-	estimatedMemory := config.LogSize * 50
+	estimatedMemory := logSize * 50
 	var memoryStr string
 	if estimatedMemory >= 1024*1024 {
 		memoryStr = fmt.Sprintf("%.2f MB", float64(estimatedMemory)/(1024*1024))
@@ -1926,7 +2223,7 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 		"total":           total,
 		"currentPage":     page,
 		"pageSize":        limit,
-		"logBufferSize":   config.LogSize,
+		"logBufferSize":   logSize,
 		"estimatedMemory": memoryStr,
 	})
 }
@@ -1996,8 +2293,106 @@ func handleSyncStop(w http.ResponseWriter, r *http.Request) {
 func handleConfigGet(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	configMu.RLock()
-	defer configMu.RUnlock()
-	json.NewEncoder(w).Encode(config)
+	public := publicConfigResponse(config)
+	configMu.RUnlock()
+	json.NewEncoder(w).Encode(public)
+}
+
+type publicConfig struct {
+	Config
+	StrmSignTokenConfigured bool `json:"strmSignTokenConfigured"`
+}
+
+func cloneConfig(cfg Config) Config {
+	cfg.SPathsAll = append([]string(nil), cfg.SPathsAll...)
+	cfg.SPool = append([]string(nil), cfg.SPool...)
+	cfg.ActivePaths = append([]string(nil), cfg.ActivePaths...)
+	cfg.StrmSourceHosts = append([]string(nil), cfg.StrmSourceHosts...)
+	cfg.StrmPendingRetryPaths = append([]string(nil), cfg.StrmPendingRetryPaths...)
+	if cfg.PathUpdateNotices != nil {
+		cfg.PathUpdateNotices = make(map[string]bool, len(cfg.PathUpdateNotices))
+		for key, value := range cfg.PathUpdateNotices {
+			cfg.PathUpdateNotices[key] = value
+		}
+	}
+	if cfg.ServerPathCounts != nil {
+		cfg.ServerPathCounts = make(map[string]int, len(cfg.ServerPathCounts))
+		for key, value := range cfg.ServerPathCounts {
+			cfg.ServerPathCounts[key] = value
+		}
+	}
+	if cfg.LocalPathCounts != nil {
+		cfg.LocalPathCounts = make(map[string]int, len(cfg.LocalPathCounts))
+		for key, value := range cfg.LocalPathCounts {
+			cfg.LocalPathCounts[key] = value
+		}
+	}
+	return cfg
+}
+
+func publicConfigResponse(cfg Config) publicConfig {
+	cfg = cloneConfig(cfg)
+	_, err := resolveStrmSignToken(cfg.StrmSignToken)
+	configured := err == nil
+	cfg.StrmSignToken = ""
+	cfg.StrmLastAppliedSign = ""
+	cfg.StrmLastAppliedFingerprint = ""
+	cfg.StrmPendingRetryPaths = nil
+	cfg.StrmPendingRetryOverflow = false
+	return publicConfig{Config: cfg, StrmSignTokenConfigured: configured}
+}
+
+// handleStrmRewriteExisting starts an explicit background repair of existing
+// STRM files. It never runs automatically at process startup.
+func handleStrmRewriteExisting(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "只支持POST请求", http.StatusMethodNotAllowed)
+		return
+	}
+	configMu.RLock()
+	enabled := config.StrmRewriteEnabled
+	baseURL := config.StrmBaseURL
+	signEndpoint := config.StrmSignEndpoint
+	signToken := config.StrmSignToken
+	sourceHosts := append([]string(nil), config.StrmSourceHosts...)
+	configGeneration := strmConfigGeneration
+	configMu.RUnlock()
+	if !enabled {
+		http.Error(w, "请先启用 STRM 重写功能", http.StatusBadRequest)
+		return
+	}
+	if _, _, err := validateStrmConfig(enabled, baseURL, signEndpoint); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	resolvedToken, err := resolveStrmSignToken(signToken)
+	if err != nil {
+		http.Error(w, "小雅签名 token 未配置", http.StatusBadRequest)
+		return
+	}
+	normalizedSourceHosts, err := normalizeStrmSourceHosts(sourceHosts)
+	if err != nil || len(normalizedSourceHosts) == 0 {
+		http.Error(w, "STRM 来源主机未正确配置", http.StatusBadRequest)
+		return
+	}
+	mediaDir := flag.Lookup("media").Value.String()
+	if !startStrmRewriteAtGeneration(mediaDir, baseURL, signEndpoint, resolvedToken, normalizedSourceHosts, configGeneration) {
+		http.Error(w, "已有 STRM 修复任务正在运行", http.StatusConflict)
+		return
+	}
+	addLog("info", "已启动现有 STRM 修复任务")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(getStrmRewriteStatus())
+}
+
+func handleStrmRewriteStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "只支持GET请求", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(getStrmRewriteStatus())
 }
 
 // filterValidServers 过滤无效的服务器 URL
@@ -2246,7 +2641,7 @@ func handleResetScanListTime(w http.ResponseWriter, r *http.Request) {
 	configMu.Lock()
 	oldTime := config.ScanListTime
 	config.ScanListTime = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
-	if err := saveConfig(); err != nil {
+	if err := saveConfigLocked(); err != nil {
 		configMu.Unlock()
 		http.Error(w, "保存配置文件失败", http.StatusInternalServerError)
 		return
@@ -2432,6 +2827,7 @@ func main() {
 
 	addLog("info", "程序初始化完成，开始后台同步")
 	go syncFiles(media)
+	startStrmSignMonitor(*media)
 
 	subFS, _ := fs.Sub(staticFiles, "static")
 	fs := http.FileServer(http.FS(subFS))
@@ -2451,6 +2847,8 @@ func main() {
 	http.HandleFunc("/api/recycle-bin/list", handleRecycleBinList)
 	http.HandleFunc("/api/reset-scanlist-time", handleResetScanListTime)
 	http.HandleFunc("/api/resources", handleResources)
+	http.HandleFunc("/api/strm/rewrite-existing", handleStrmRewriteExisting)
+	http.HandleFunc("/api/strm/rewrite-status", handleStrmRewriteStatus)
 	http.Handle("/", fs)
 
 	addr := fmt.Sprintf(":%d", *port)

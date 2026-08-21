@@ -179,6 +179,43 @@ https://example2.com"></textarea>
                     <button class="primary" onclick="saveMemoryConfig()"><i class="fas fa-save"></i> 保存</button>
                 </div>
             </div>
+
+            <div class="section">
+                <div class="section-title">STRM 地址重写</div>
+                <div class="input-group">
+                    <label for="strmRewriteEnabled">启用 STRM 重写：</label>
+                    <input type="checkbox" id="strmRewriteEnabled">
+                    <span class="help-text">仅处理路径以 /d/ 开头的小雅 HTTP(S) 地址</span>
+                </div>
+                <div class="input-group">
+                    <label for="strmBaseUrl">STRM 基础地址：</label>
+                    <input class="strm-url-input" type="url" id="strmBaseUrl" placeholder="http://192.168.101.200:5678">
+                </div>
+                <div class="input-group">
+                    <label for="strmSignEndpoint">签名接口地址（只读）：</label>
+                    <input class="strm-url-input" type="url" id="strmSignEndpoint" placeholder="http://xiaoya/api/getsignmd5" readonly>
+                    <span class="help-text">由 XIAOYA_STRM_SIGN_ENDPOINT 或配置文件设置，Web API 不可修改。</span>
+                </div>
+                <div class="input-group">
+                    <label for="strmSignToken">小雅签名 token：</label>
+                    <input class="strm-url-input" type="password" id="strmSignToken" placeholder="已配置时留空保持不变" autocomplete="new-password">
+                    <span class="help-text" id="strmTokenStatus">未配置</span>
+                </div>
+                <div class="input-group">
+                    <label for="strmSourceHosts">允许来源主机：</label>
+                    <textarea class="strm-source-hosts" id="strmSourceHosts" placeholder="xiaoya.host:5678&#10;192.168.101.200:5678"></textarea>
+                    <span class="help-text">每行一个主机；带端口时精确匹配，不带端口时匹配该主机的所有端口</span>
+                </div>
+                <div class="input-group">
+                    <label for="strmSignTokenClear">清除已保存 token：</label>
+                    <input type="checkbox" id="strmSignTokenClear">
+                    <button class="primary" onclick="saveStrmConfig()"><i class="fas fa-save"></i> 保存 STRM 配置</button>
+                </div>
+                <div class="strm-rewrite-status">
+                    <span>历史修复状态：</span><span id="strmRewriteStatus">未运行</span>
+                    <button class="primary" id="rewriteExistingStrmBtn" onclick="rewriteExistingStrm()">修复现有 STRM</button>
+                </div>
+            </div>
         </div>
     </div>
     <footer class="telegram-footer">

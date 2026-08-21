@@ -44,7 +44,10 @@ document.querySelectorAll('.tab-button').forEach(button => {
 async function fetchAPI(endpoint, options = {}) {
     try {
         const response = await fetch(endpoint, options);
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        if (!response.ok) {
+            const message = await response.text();
+            throw new Error(message || `HTTP error: ${response.status}`);
+        }
         return await response.json();
     } catch (error) {
         showStatus(`请求失败: ${error.message}`, true);
@@ -377,6 +380,106 @@ async function loadConfigPage() {
     await loadBandwidthConfig();
     await loadConcurrencyConfig();
     await loadMemoryConfig();
+    await loadStrmConfig();
+}
+
+async function loadStrmConfig() {
+    try {
+        const config = await fetchAPI('/api/config/get');
+        document.getElementById('strmRewriteEnabled').checked = config.strmRewriteEnabled || false;
+        document.getElementById('strmBaseUrl').value = config.strmBaseUrl || '';
+        document.getElementById('strmSignEndpoint').value = config.strmSignEndpoint || 'http://xiaoya/api/getsignmd5';
+        document.getElementById('strmSignToken').value = '';
+        document.getElementById('strmSignTokenClear').checked = false;
+        document.getElementById('strmSourceHosts').value = (config.strmSourceHosts || []).join('\n');
+        document.getElementById('strmTokenStatus').textContent = config.strmSignTokenConfigured ? '已配置，留空保持不变' : '未配置';
+        await loadStrmRewriteStatus();
+    } catch (error) {
+        showStatus(`加载 STRM 配置失败: ${error.message}`, true);
+    }
+}
+
+async function saveStrmConfig() {
+    const strmRewriteEnabled = document.getElementById('strmRewriteEnabled').checked;
+    const strmBaseUrl = document.getElementById('strmBaseUrl').value.trim();
+    const strmSignToken = document.getElementById('strmSignToken').value.trim();
+    const strmSignTokenClear = document.getElementById('strmSignTokenClear').checked;
+    const strmSourceHosts = document.getElementById('strmSourceHosts').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+    if (strmRewriteEnabled && !strmBaseUrl) {
+        showStatus('启用 STRM 重写时基础地址不能为空', true);
+        return;
+    }
+    if (strmRewriteEnabled && strmSourceHosts.length === 0) {
+        showStatus('启用 STRM 重写时至少需要配置一个来源主机', true);
+        return;
+    }
+    if (strmSignToken && strmSignTokenClear) {
+        showStatus('不能同时设置并清除 STRM 签名 token', true);
+        return;
+    }
+    if (strmBaseUrl && !/^https?:\/\/[^\s/?#]+(?:\/[^\s?#]*)?$/i.test(strmBaseUrl)) {
+        showStatus('STRM 基础地址必须是合法的 http 或 https URL，且不能包含查询参数或 fragment', true);
+        return;
+    }
+    try {
+        const payload = { strmRewriteEnabled, strmBaseUrl, strmSourceHosts, strmSignTokenClear };
+        if (strmSignToken) payload.strmSignToken = strmSignToken;
+        await fetchAPI('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        document.getElementById('strmSignToken').value = '';
+        document.getElementById('strmSignTokenClear').checked = false;
+        await loadStrmConfig();
+        showStatus(`STRM 重写已${strmRewriteEnabled ? '启用' : '关闭'}`);
+    } catch (error) {
+        showStatus(`保存 STRM 配置失败: ${error.message}`, true);
+    }
+}
+
+function renderStrmRewriteStatus(data) {
+    const statusElement = document.getElementById('strmRewriteStatus');
+    const button = document.getElementById('rewriteExistingStrmBtn');
+    if (!statusElement || !button) return;
+    button.disabled = data.running;
+    const pendingRetryCount = data.pendingRetryCount || 0;
+    const retryNotice = data.pendingRetryOverflow
+        ? `；失败过多，需要手工全量修复（待记录 ${pendingRetryCount} 个）`
+        : pendingRetryCount > 0 ? `；待重试 ${pendingRetryCount} 个` : '';
+    if (data.running) {
+        statusElement.textContent = `运行中：已扫描 ${data.scanned}，更新 ${data.updated}，跳过 ${data.skipped}，失败 ${data.failed}${retryNotice}`;
+    } else if (data.pendingRetryOverflow) {
+        statusElement.textContent = `失败过多，需要手工全量修复（待记录 ${pendingRetryCount} 个）`;
+    } else if (data.finishedAt) {
+        const error = data.lastError ? `；${data.lastError}` : '';
+        statusElement.textContent = `完成：扫描 ${data.scanned}，更新 ${data.updated}，跳过 ${data.skipped}，失败 ${data.failed}${error}${retryNotice}`;
+    } else {
+        statusElement.textContent = '未运行';
+    }
+}
+
+async function loadStrmRewriteStatus() {
+    try {
+        const data = await fetchAPI('/api/strm/rewrite-status');
+        renderStrmRewriteStatus(data);
+        if (data.running) setTimeout(loadStrmRewriteStatus, 1500);
+    } catch (error) {
+        showStatus(`加载 STRM 修复状态失败: ${error.message}`, true);
+    }
+}
+
+async function rewriteExistingStrm() {
+    const button = document.getElementById('rewriteExistingStrmBtn');
+    button.disabled = true;
+    try {
+        await fetchAPI('/api/strm/rewrite-existing', { method: 'POST' });
+        showStatus('已启动现有 STRM 修复任务');
+        await loadStrmRewriteStatus();
+    } catch (error) {
+        button.disabled = false;
+        showStatus(`启动 STRM 修复失败: ${error.message}`, true);
+    }
 }
 
 async function loadDNSConfig() {
