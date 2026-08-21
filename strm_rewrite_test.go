@@ -1220,6 +1220,29 @@ func TestRewriteSTRMFileAtomicPreservesMtime(t *testing.T) {
 	}
 }
 
+func TestRewriteSTRMFileAtomicUsesShortTemporaryName(t *testing.T) {
+	name := strings.Repeat("a", 240) + ".strm"
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte("http://old-host/d/video.mp4"), 0640); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := rewriteSTRMFileAtomic(path, "http://new-host/", testSign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("文件应被改写")
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(content), "http://new-host/d/video.mp4?sign=") {
+		t.Fatalf("改写内容错误: %q", content)
+	}
+}
+
 func TestStartStrmRewritePreventsDuplicateTasks(t *testing.T) {
 	oldStatus := getStrmRewriteStatus()
 	defer func() {

@@ -606,7 +606,11 @@ func rewriteSTRMFileAtomicWithHosts(path, baseURL, sign string, sourceHosts []st
 		return false, err
 	}
 
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".rewrite-*")
+	// Keep the temporary basename independent of the original filename. A
+	// STRM basename can already be close to the filesystem limit, and copying
+	// it into the temporary name can make CreateTemp fail with ENAMETOOLONG or
+	// a filesystem-specific "not supported" error.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".strm.rewrite-*")
 	if err != nil {
 		return false, fmt.Errorf("创建 STRM 临时文件失败")
 	}
