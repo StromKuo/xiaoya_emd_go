@@ -42,32 +42,34 @@ const (
 
 // Config 定义程序的配置文件结构
 type Config struct {
-	SPathsAll                  []string        `json:"sPathsAll"`
-	SPool                      []string        `json:"sPool"`
-	ActivePaths                []string        `json:"activePaths"`
-	Interval                   int             `json:"interval"`
-	ScanListTime               time.Time       `json:"scanListTime"`
-	DNSType                    DNSType         `json:"dnsType"`
-	DNSServer                  string          `json:"dnsServer"`
-	DNSEnabled                 bool            `json:"dnsEnabled"`
-	LogSize                    int             `json:"logSize"`
-	BandwidthLimitEnabled      bool            `json:"bandwidthLimitEnabled"`
-	BandwidthLimitMBps         float64         `json:"bandwidthLimitMBps"`
-	MaxConcurrency             int             `json:"maxConcurrency"`
-	PathUpdateNotices          map[string]bool `json:"pathUpdateNotices"`
-	ServerPathCounts           map[string]int  `json:"serverPathCounts"`
-	LocalPathCounts            map[string]int  `json:"localPathCounts"`
-	MemoryLimitEnabled         bool            `json:"memoryLimitEnabled"` //内存限制开关
-	MemoryLimitMB              float64         `json:"memoryLimitMB"`      //内存限制（MB）
-	StrmRewriteEnabled         bool            `json:"strmRewriteEnabled"`
-	StrmBaseURL                string          `json:"strmBaseUrl"`
-	StrmSignEndpoint           string          `json:"strmSignEndpoint"`
-	StrmSignToken              string          `json:"strmSignToken"`
-	StrmSourceHosts            []string        `json:"strmSourceHosts"`
-	StrmLastAppliedSign        string          `json:"strmLastAppliedSign,omitempty"`
-	StrmLastAppliedFingerprint string          `json:"strmLastAppliedFingerprint,omitempty"`
-	StrmPendingRetryPaths      []string        `json:"strmPendingRetryPaths,omitempty"`
-	StrmPendingRetryOverflow   bool            `json:"strmPendingRetryOverflow,omitempty"`
+	SPathsAll                  []string           `json:"sPathsAll"`
+	SPool                      []string           `json:"sPool"`
+	ActivePaths                []string           `json:"activePaths"`
+	Interval                   int                `json:"interval"`
+	ScanListTime               time.Time          `json:"scanListTime"`
+	DNSType                    DNSType            `json:"dnsType"`
+	DNSServer                  string             `json:"dnsServer"`
+	DNSEnabled                 bool               `json:"dnsEnabled"`
+	LogSize                    int                `json:"logSize"`
+	BandwidthLimitEnabled      bool               `json:"bandwidthLimitEnabled"`
+	BandwidthLimitMBps         float64            `json:"bandwidthLimitMBps"`
+	MaxConcurrency             int                `json:"maxConcurrency"`
+	PathUpdateNotices          map[string]bool    `json:"pathUpdateNotices"`
+	ServerPathCounts           map[string]int     `json:"serverPathCounts"`
+	LocalPathCounts            map[string]int     `json:"localPathCounts"`
+	MemoryLimitEnabled         bool               `json:"memoryLimitEnabled"` //内存限制开关
+	MemoryLimitMB              float64            `json:"memoryLimitMB"`      //内存限制（MB）
+	StrmRewriteEnabled         bool               `json:"strmRewriteEnabled"`
+	StrmBaseURL                string             `json:"strmBaseUrl"`
+	StrmSignEndpoint           string             `json:"strmSignEndpoint"`
+	StrmSignToken              string             `json:"strmSignToken"`
+	StrmSourceHosts            []string           `json:"strmSourceHosts"`
+	StrmLastAppliedSign        string             `json:"strmLastAppliedSign,omitempty"`
+	StrmLastAppliedFingerprint string             `json:"strmLastAppliedFingerprint,omitempty"`
+	StrmPendingRetryPaths      []string           `json:"strmPendingRetryPaths,omitempty"`
+	StrmPendingRetryOverflow   bool               `json:"strmPendingRetryOverflow,omitempty"`
+	StrmParseFailureReports    []StrmParseFailure `json:"strmParseFailureReports,omitempty"`
+	StrmParseFailureOverflow   bool               `json:"strmParseFailureOverflow,omitempty"`
 }
 
 // LogEntry 定义日志条目结构
@@ -2070,6 +2072,8 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 		config.StrmLastAppliedFingerprint = ""
 		config.StrmPendingRetryPaths = nil
 		config.StrmPendingRetryOverflow = false
+		config.StrmParseFailureReports = nil
+		config.StrmParseFailureOverflow = false
 		addLog("info", fmt.Sprintf("STRM 重写已%s", map[bool]string{true: "启用", false: "关闭"}[config.StrmRewriteEnabled]))
 	}
 	if err := saveConfigLocked(); err != nil {
@@ -2309,6 +2313,7 @@ func cloneConfig(cfg Config) Config {
 	cfg.ActivePaths = append([]string(nil), cfg.ActivePaths...)
 	cfg.StrmSourceHosts = append([]string(nil), cfg.StrmSourceHosts...)
 	cfg.StrmPendingRetryPaths = append([]string(nil), cfg.StrmPendingRetryPaths...)
+	cfg.StrmParseFailureReports = append([]StrmParseFailure(nil), cfg.StrmParseFailureReports...)
 	if cfg.PathUpdateNotices != nil {
 		cfg.PathUpdateNotices = make(map[string]bool, len(cfg.PathUpdateNotices))
 		for key, value := range cfg.PathUpdateNotices {
@@ -2339,6 +2344,8 @@ func publicConfigResponse(cfg Config) publicConfig {
 	cfg.StrmLastAppliedFingerprint = ""
 	cfg.StrmPendingRetryPaths = nil
 	cfg.StrmPendingRetryOverflow = false
+	cfg.StrmParseFailureReports = nil
+	cfg.StrmParseFailureOverflow = false
 	return publicConfig{Config: cfg, StrmSignTokenConfigured: configured}
 }
 
@@ -2392,6 +2399,79 @@ func handleStrmRewriteStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(getStrmRewriteStatus())
+}
+
+func handleStrmParseFailures(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "只支持GET请求", http.StatusMethodNotAllowed)
+		return
+	}
+	configMu.RLock()
+	reports := append([]StrmParseFailure(nil), config.StrmParseFailureReports...)
+	overflow := config.StrmParseFailureOverflow
+	configMu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"count":    len(reports),
+		"overflow": overflow,
+		"failures": reports,
+	})
+}
+
+func handleStrmParseFailureRewrite(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "只支持POST请求", http.StatusMethodNotAllowed)
+		return
+	}
+	configMu.RLock()
+	enabled := config.StrmRewriteEnabled
+	baseURL := config.StrmBaseURL
+	signEndpoint := config.StrmSignEndpoint
+	signToken := config.StrmSignToken
+	sourceHosts := append([]string(nil), config.StrmSourceHosts...)
+	reports := append([]StrmParseFailure(nil), config.StrmParseFailureReports...)
+	overflow := config.StrmParseFailureOverflow
+	configGeneration := strmConfigGeneration
+	configMu.RUnlock()
+	if !enabled {
+		http.Error(w, "请先启用 STRM 重写功能", http.StatusBadRequest)
+		return
+	}
+	if overflow {
+		http.Error(w, "解析失败报告已超过上限，请先执行全量修复", http.StatusConflict)
+		return
+	}
+	reports = normalizeStrmParseFailureReports(reports)
+	if len(reports) == 0 {
+		http.Error(w, "当前没有解析失败的 STRM 文件", http.StatusBadRequest)
+		return
+	}
+	if _, _, err := validateStrmConfig(enabled, baseURL, signEndpoint); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	resolvedToken, err := resolveStrmSignToken(signToken)
+	if err != nil {
+		http.Error(w, "小雅签名 token 未配置", http.StatusBadRequest)
+		return
+	}
+	sign, _, _, usedStale, err := strmSignCache.GetWithChange(context.Background(), signEndpoint, resolvedToken)
+	if err != nil || usedStale {
+		http.Error(w, "签名接口暂时不可用，请稍后重试", http.StatusServiceUnavailable)
+		return
+	}
+	mediaDir := flag.Lookup("media").Value.String()
+	started := startStrmParseFailureRewriteAtGeneration(mediaDir, baseURL, sign, sourceHosts, reports, configGeneration, func(result StrmRewriteResult) error {
+		return persistStrmParseFailureResult(baseURL, signEndpoint, resolvedToken, sourceHosts, result)
+	})
+	if !started {
+		http.Error(w, "已有 STRM 修复任务正在运行", http.StatusConflict)
+		return
+	}
+	addLog("info", fmt.Sprintf("已启动解析失败 STRM 定向修复任务，共 %d 个", len(reports)))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(getStrmRewriteStatus())
 }
 
@@ -2849,6 +2929,8 @@ func main() {
 	http.HandleFunc("/api/resources", handleResources)
 	http.HandleFunc("/api/strm/rewrite-existing", handleStrmRewriteExisting)
 	http.HandleFunc("/api/strm/rewrite-status", handleStrmRewriteStatus)
+	http.HandleFunc("/api/strm/parse-failures", handleStrmParseFailures)
+	http.HandleFunc("/api/strm/rewrite-parse-failures", handleStrmParseFailureRewrite)
 	http.Handle("/", fs)
 
 	addr := fmt.Sprintf(":%d", *port)

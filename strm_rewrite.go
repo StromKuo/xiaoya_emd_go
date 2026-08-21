@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,22 +20,30 @@ import (
 )
 
 const (
-	defaultStrmSignEndpoint  = "http://xiaoya/api/getsignmd5"
-	strmSignCacheTTL         = 10 * time.Minute
-	strmSignStaleGrace       = 30 * time.Minute
-	strmSignRetryBackoff     = 30 * time.Second
-	strmSignRequestTimeout   = 10 * time.Second
-	strmSignMonitorInterval  = 10 * time.Minute
-	maxStrmPendingRetryPaths = 10000
-	strmSignCommand          = "cat md5"
-	strmSignEndpointEnv      = "XIAOYA_STRM_SIGN_ENDPOINT"
-	strmSignTokenFileEnv     = "XIAOYA_STRM_TOKEN_FILE"
+	defaultStrmSignEndpoint    = "http://xiaoya/api/getsignmd5"
+	strmSignCacheTTL           = 10 * time.Minute
+	strmSignStaleGrace         = 30 * time.Minute
+	strmSignRetryBackoff       = 30 * time.Second
+	strmSignRequestTimeout     = 10 * time.Second
+	strmSignMonitorInterval    = 10 * time.Minute
+	maxStrmPendingRetryPaths   = 10000
+	maxStrmParseFailureReports = 10000
+	strmSignCommand            = "cat md5"
+	strmSignEndpointEnv        = "XIAOYA_STRM_SIGN_ENDPOINT"
+	strmSignTokenFileEnv       = "XIAOYA_STRM_TOKEN_FILE"
 )
 
 var md5SignPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
 
 var errStrmSignFetch = errors.New("STRM 签名获取失败")
 var errStrmConfigChanged = errors.New("STRM 配置已变化")
+
+// StrmParseFailure records a STRM file whose content cannot be parsed. These
+// failures are kept for targeted manual repair, not automatic retry.
+type StrmParseFailure struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
+}
 
 // SignCache caches the current Xiaoya sign and serializes refreshes so a
 // concurrent sync only sends one request to the sign endpoint.
@@ -429,6 +438,11 @@ func applyStrmConfigDefaults(cfg *Config) error {
 	}
 	cfg.StrmSignToken = strings.TrimSpace(cfg.StrmSignToken)
 	cfg.StrmSourceHosts = normalizedHosts
+	parseFailureReports := normalizeStrmParseFailureReports(cfg.StrmParseFailureReports)
+	if len(cfg.StrmParseFailureReports) > maxStrmParseFailureReports {
+		cfg.StrmParseFailureOverflow = true
+	}
+	cfg.StrmParseFailureReports = parseFailureReports
 	return nil
 }
 
@@ -642,6 +656,8 @@ type StrmRewriteStatus struct {
 	Failed               int       `json:"failed"`
 	PendingRetryCount    int       `json:"pendingRetryCount"`
 	PendingRetryOverflow bool      `json:"pendingRetryOverflow"`
+	ParseFailureCount    int       `json:"parseFailureCount"`
+	ParseFailureOverflow bool      `json:"parseFailureOverflow"`
 	LastError            string    `json:"lastError,omitempty"`
 	StartedAt            time.Time `json:"startedAt,omitempty"`
 	FinishedAt           time.Time `json:"finishedAt,omitempty"`
@@ -660,6 +676,8 @@ func getStrmRewriteStatus() StrmRewriteStatus {
 	configMu.RLock()
 	status.PendingRetryCount = len(config.StrmPendingRetryPaths)
 	status.PendingRetryOverflow = config.StrmPendingRetryOverflow
+	status.ParseFailureCount = len(config.StrmParseFailureReports)
+	status.ParseFailureOverflow = config.StrmParseFailureOverflow
 	configMu.RUnlock()
 	return status
 }
@@ -688,6 +706,14 @@ func startStrmRewriteWithSignAtGeneration(mediaDir, baseURL, sign string, source
 }
 
 func startStrmRewriteWithSignResultAtGeneration(mediaDir, baseURL, sign string, sourceHosts, retryPaths []string, generation uint64, onSuccess func(StrmRewriteResult) error) bool {
+	return startStrmRewriteWithSelectionAtGeneration(mediaDir, baseURL, sign, sourceHosts, retryPaths, nil, generation, onSuccess)
+}
+
+func startStrmParseFailureRewriteAtGeneration(mediaDir, baseURL, sign string, sourceHosts []string, parseFailures []StrmParseFailure, generation uint64, onSuccess func(StrmRewriteResult) error) bool {
+	return startStrmRewriteWithSelectionAtGeneration(mediaDir, baseURL, sign, sourceHosts, nil, parseFailures, generation, onSuccess)
+}
+
+func startStrmRewriteWithSelectionAtGeneration(mediaDir, baseURL, sign string, sourceHosts, retryPaths []string, parseFailures []StrmParseFailure, generation uint64, onSuccess func(StrmRewriteResult) error) bool {
 	return startStrmRewriteJob(func() {
 		if generation != 0 && !strmConfigGenerationMatches(generation) {
 			updateStrmRewriteStatus(func(status *StrmRewriteStatus) {
@@ -695,7 +721,7 @@ func startStrmRewriteWithSignResultAtGeneration(mediaDir, baseURL, sign string, 
 			})
 			return
 		}
-		result := runStrmRewriteWithSignResultAtGeneration(mediaDir, baseURL, sign, sourceHosts, retryPaths, generation)
+		result := runStrmRewriteWithSelectionAtGeneration(mediaDir, baseURL, sign, sourceHosts, retryPaths, parseFailures, generation)
 		if !result.Completed || onSuccess == nil {
 			if !result.Completed {
 				delayStrmSignMonitorRetry(strmSignRetryBackoff)
@@ -792,7 +818,7 @@ func runStrmRewriteAtGeneration(mediaDir, baseURL, signEndpoint, signToken strin
 		return
 	}
 	if !usedStale {
-		if err := persistStrmAppliedState(sign, baseURL, signEndpoint, resolvedToken, sourceHosts, result.RetryPaths, result.RetryOverflow); err != nil {
+		if err := persistStrmAppliedStateFromResult(sign, baseURL, signEndpoint, resolvedToken, sourceHosts, result); err != nil {
 			delayStrmSignMonitorRetry(strmSignRetryBackoff)
 			updateStrmRewriteStatus(func(status *StrmRewriteStatus) {
 				status.Failed++
@@ -803,6 +829,12 @@ func runStrmRewriteAtGeneration(mediaDir, baseURL, signEndpoint, signToken strin
 		} else {
 			resetStrmSignMonitorRetry()
 		}
+	} else if err := persistStrmStaleScanResult(baseURL, signEndpoint, resolvedToken, sourceHosts, result); err != nil {
+		delayStrmSignMonitorRetry(strmSignRetryBackoff)
+		updateStrmRewriteStatus(func(status *StrmRewriteStatus) {
+			status.Failed++
+			status.LastError = "保存 STRM 解析失败报告失败"
+		})
 	}
 }
 
@@ -815,12 +847,23 @@ func runStrmRewriteWithSignAtGeneration(mediaDir, baseURL, sign string, sourceHo
 }
 
 type StrmRewriteResult struct {
-	Completed     bool
-	RetryPaths    []string
-	RetryOverflow bool
+	Completed               bool
+	RetryPaths              []string
+	RetryOverflow           bool
+	ParseFailureReports     []StrmParseFailure
+	ParseFailureOverflow    bool
+	ParseFailureReportReady bool
 }
 
 func runStrmRewriteWithSignResultAtGeneration(mediaDir, baseURL, sign string, sourceHosts, retryPaths []string, generation uint64) StrmRewriteResult {
+	return runStrmRewriteWithSelectionAtGeneration(mediaDir, baseURL, sign, sourceHosts, retryPaths, nil, generation)
+}
+
+func runStrmParseFailureRewriteAtGeneration(mediaDir, baseURL, sign string, sourceHosts []string, parseFailures []StrmParseFailure, generation uint64) StrmRewriteResult {
+	return runStrmRewriteWithSelectionAtGeneration(mediaDir, baseURL, sign, sourceHosts, nil, parseFailures, generation)
+}
+
+func runStrmRewriteWithSelectionAtGeneration(mediaDir, baseURL, sign string, sourceHosts, retryPaths []string, parseFailurePaths []StrmParseFailure, generation uint64) StrmRewriteResult {
 	if generation != 0 && !strmConfigGenerationMatches(generation) {
 		updateStrmRewriteStatus(func(status *StrmRewriteStatus) {
 			status.LastError = "STRM 配置已变化，取消历史修复"
@@ -860,6 +903,19 @@ func runStrmRewriteWithSignResultAtGeneration(mediaDir, baseURL, sign string, so
 		return StrmRewriteResult{}
 	}
 
+	fullScan := retryPaths == nil && parseFailurePaths == nil
+	configMu.RLock()
+	existingParseFailures := append([]StrmParseFailure(nil), config.StrmParseFailureReports...)
+	existingParseFailureOverflow := config.StrmParseFailureOverflow
+	configMu.RUnlock()
+	parseFailureMap := make(map[string]StrmParseFailure)
+	parseFailureOverflow := false
+	if !fullScan {
+		for _, failure := range normalizeStrmParseFailureReports(existingParseFailures) {
+			parseFailureMap[failure.Path] = failure
+		}
+		parseFailureOverflow = existingParseFailureOverflow
+	}
 	retrySet := make(map[string]struct{})
 	var pendingRetryPaths []string
 	retryOverflow := false
@@ -878,6 +934,31 @@ func runStrmRewriteWithSignResultAtGeneration(mediaDir, baseURL, sign string, so
 		retrySet[relativePath] = struct{}{}
 		pendingRetryPaths = append(pendingRetryPaths, relativePath)
 	}
+	removeParseFailure := func(path string) {
+		relativePath, err := strmRetryRelativePath(mediaDir, path)
+		if err == nil {
+			delete(parseFailureMap, relativePath)
+		}
+	}
+	addParseFailure := func(path, reason string) {
+		relativePath, err := strmRetryRelativePath(mediaDir, path)
+		if err != nil {
+			return
+		}
+		reason = strings.TrimSpace(reason)
+		if reason == "" {
+			reason = "STRM 解析失败"
+		}
+		if _, exists := parseFailureMap[relativePath]; exists {
+			parseFailureMap[relativePath] = StrmParseFailure{Path: relativePath, Reason: reason}
+			return
+		}
+		if len(parseFailureMap) >= maxStrmParseFailureReports {
+			parseFailureOverflow = true
+			return
+		}
+		parseFailureMap[relativePath] = StrmParseFailure{Path: relativePath, Reason: reason}
+	}
 
 	processFile := func(path string) error {
 		if generation != 0 && !strmConfigGenerationMatches(generation) {
@@ -886,7 +967,6 @@ func runStrmRewriteWithSignResultAtGeneration(mediaDir, baseURL, sign string, so
 		if !strings.EqualFold(filepath.Ext(path), ".strm") {
 			return nil
 		}
-
 		updateStrmRewriteStatus(func(status *StrmRewriteStatus) {
 			status.Scanned++
 		})
@@ -901,11 +981,15 @@ func runStrmRewriteWithSignResultAtGeneration(mediaDir, baseURL, sign string, so
 		}
 		source, needsRewrite, parseErr := parseStrmURL(content)
 		if parseErr != nil {
+			addParseFailure(path, parseErr.Error())
 			updateStrmRewriteStatus(func(status *StrmRewriteStatus) {
 				status.Failed++
 				status.LastError = fmt.Sprintf("文件 %s：%v", filepath.Base(path), parseErr)
 			})
 			return nil
+		}
+		if !fullScan {
+			removeParseFailure(path)
 		}
 		if !needsRewrite || !strmSourceOrTargetHostAllowed(source, normalizedSourceHosts, base) {
 			updateStrmRewriteStatus(func(status *StrmRewriteStatus) {
@@ -933,7 +1017,7 @@ func runStrmRewriteWithSignResultAtGeneration(mediaDir, baseURL, sign string, so
 	}
 
 	var walkErr error
-	if retryPaths == nil {
+	if fullScan {
 		recycleDir := filepath.Join(mediaDir, "recycle_bin")
 		walkErr = filepath.WalkDir(mediaDir, func(path string, entry os.DirEntry, err error) error {
 			if generation != 0 && !strmConfigGenerationMatches(generation) {
@@ -950,6 +1034,35 @@ func runStrmRewriteWithSignResultAtGeneration(mediaDir, baseURL, sign string, so
 			}
 			return processFile(path)
 		})
+	} else if parseFailurePaths != nil {
+		for _, failure := range normalizeStrmParseFailureReports(parseFailurePaths) {
+			if generation != 0 && !strmConfigGenerationMatches(generation) {
+				walkErr = errStrmConfigChanged
+				break
+			}
+			path := filepath.Join(mediaDir, filepath.FromSlash(failure.Path))
+			info, statErr := os.Stat(path)
+			if statErr != nil {
+				if os.IsNotExist(statErr) {
+					removeParseFailure(path)
+					continue
+				}
+				addRetryPath(path)
+				updateStrmRewriteStatus(func(status *StrmRewriteStatus) {
+					status.Failed++
+					status.LastError = fmt.Sprintf("文件 %s：读取 STRM 文件信息失败", filepath.Base(path))
+				})
+				continue
+			}
+			if info.IsDir() {
+				removeParseFailure(path)
+				continue
+			}
+			if err := processFile(path); err != nil {
+				walkErr = err
+				break
+			}
+		}
 	} else {
 		for _, relativePath := range normalizeStrmRetryPaths(retryPaths) {
 			if generation != 0 && !strmConfigGenerationMatches(generation) {
@@ -959,7 +1072,9 @@ func runStrmRewriteWithSignResultAtGeneration(mediaDir, baseURL, sign string, so
 			path := filepath.Join(mediaDir, filepath.FromSlash(relativePath))
 			info, statErr := os.Stat(path)
 			if statErr != nil {
-				if !os.IsNotExist(statErr) {
+				if os.IsNotExist(statErr) {
+					removeParseFailure(path)
+				} else {
 					addRetryPath(path)
 					updateStrmRewriteStatus(func(status *StrmRewriteStatus) {
 						status.Failed++
@@ -993,9 +1108,28 @@ func runStrmRewriteWithSignResultAtGeneration(mediaDir, baseURL, sign string, so
 			status.LastError = "失败过多，需要手工全量修复"
 		})
 	}
-	// 单个 STRM 的解析失败视为永久异常；读取或原子替换失败进入待重试列表。
-	// 只要目录遍历本身成功，本次签名状态即可落库，监控随后只重试这些路径。
-	return StrmRewriteResult{Completed: walkErr == nil, RetryPaths: pendingRetryPaths, RetryOverflow: retryOverflow}
+	if parseFailureOverflow {
+		updateStrmRewriteStatus(func(status *StrmRewriteStatus) {
+			status.LastError = "解析失败报告过多，需要执行全量修复"
+		})
+	}
+	parseFailureReports := make([]StrmParseFailure, 0, len(parseFailureMap))
+	for _, failure := range parseFailureMap {
+		parseFailureReports = append(parseFailureReports, failure)
+	}
+	sort.Slice(parseFailureReports, func(i, j int) bool {
+		return parseFailureReports[i].Path < parseFailureReports[j].Path
+	})
+	// 单个 STRM 的解析失败视为永久异常并保存报告；读取或原子替换失败进入待重试列表。
+	// 只要目录遍历本身成功，本次签名状态即可落库，监控随后只重试待重试路径。
+	return StrmRewriteResult{
+		Completed:               walkErr == nil,
+		RetryPaths:              pendingRetryPaths,
+		RetryOverflow:           retryOverflow,
+		ParseFailureReports:     parseFailureReports,
+		ParseFailureOverflow:    parseFailureOverflow,
+		ParseFailureReportReady: walkErr == nil,
+	}
 }
 
 func persistStrmLastAppliedSign(sign, baseURL, signEndpoint, token string, sourceHosts []string) error {
@@ -1003,6 +1137,88 @@ func persistStrmLastAppliedSign(sign, baseURL, signEndpoint, token string, sourc
 }
 
 func persistStrmAppliedState(sign, baseURL, signEndpoint, token string, sourceHosts, retryPaths []string, retryOverflow bool) error {
+	return persistStrmAppliedStateWithParseFailures(sign, baseURL, signEndpoint, token, sourceHosts, retryPaths, retryOverflow, nil, false, false)
+}
+
+func persistStrmAppliedStateFromResult(sign, baseURL, signEndpoint, token string, sourceHosts []string, result StrmRewriteResult) error {
+	return persistStrmAppliedStateWithParseFailures(sign, baseURL, signEndpoint, token, sourceHosts, result.RetryPaths, result.RetryOverflow, result.ParseFailureReports, result.ParseFailureOverflow, result.ParseFailureReportReady)
+}
+
+func persistStrmParseFailureResult(baseURL, signEndpoint, token string, sourceHosts []string, result StrmRewriteResult) error {
+	return persistStrmParseFailureResultWithRetryMode(baseURL, signEndpoint, token, sourceHosts, result, true)
+}
+
+// persistStrmStaleScanResult records the completed full scan performed with a
+// stale sign without claiming that the sign was applied. Full scans replace
+// retry paths; targeted repairs merge them so unrelated pending work is kept.
+func persistStrmStaleScanResult(baseURL, signEndpoint, token string, sourceHosts []string, result StrmRewriteResult) error {
+	return persistStrmParseFailureResultWithRetryMode(baseURL, signEndpoint, token, sourceHosts, result, false)
+}
+
+func persistStrmParseFailureResultWithRetryMode(baseURL, signEndpoint, token string, sourceHosts []string, result StrmRewriteResult, mergeRetryPaths bool) error {
+	if !result.ParseFailureReportReady {
+		return fmt.Errorf("解析失败报告未完成")
+	}
+	normalizedBaseURL, err := normalizeStrmBaseURL(baseURL)
+	if err != nil {
+		return err
+	}
+	normalizedEndpoint, err := normalizeStrmSignEndpoint(signEndpoint)
+	if err != nil {
+		return err
+	}
+	normalizedHosts, err := normalizeStrmSourceHosts(sourceHosts)
+	if err != nil {
+		return err
+	}
+	tokenFingerprint := sha256.Sum256([]byte(strings.TrimSpace(token)))
+
+	configMu.Lock()
+	defer configMu.Unlock()
+	if !config.StrmRewriteEnabled || config.StrmBaseURL != normalizedBaseURL || config.StrmSignEndpoint != normalizedEndpoint || !equalStrmHosts(config.StrmSourceHosts, normalizedHosts) {
+		return fmt.Errorf("STRM 配置已变化")
+	}
+	currentToken, err := resolveStrmSignToken(config.StrmSignToken)
+	if err != nil || sha256.Sum256([]byte(currentToken)) != tokenFingerprint {
+		return fmt.Errorf("STRM token 已变化")
+	}
+
+	normalizedRetryPaths := normalizeStrmRetryPaths(result.RetryPaths)
+	retryOverflow := result.RetryOverflow
+	if mergeRetryPaths {
+		mergedRetryPaths := append([]string(nil), config.StrmPendingRetryPaths...)
+		mergedRetryPaths = append(mergedRetryPaths, result.RetryPaths...)
+		normalizedRetryPaths = normalizeStrmRetryPaths(mergedRetryPaths)
+		retryOverflow = config.StrmPendingRetryOverflow || result.RetryOverflow
+	}
+	if len(normalizedRetryPaths) > maxStrmPendingRetryPaths {
+		normalizedRetryPaths = normalizedRetryPaths[:maxStrmPendingRetryPaths]
+		retryOverflow = true
+	}
+	normalizedParseFailures := normalizeStrmParseFailureReports(result.ParseFailureReports)
+	parseFailureOverflow := result.ParseFailureOverflow
+	previousRetryPaths := append([]string(nil), config.StrmPendingRetryPaths...)
+	previousRetryOverflow := config.StrmPendingRetryOverflow
+	previousParseFailures := append([]StrmParseFailure(nil), config.StrmParseFailureReports...)
+	previousParseFailureOverflow := config.StrmParseFailureOverflow
+	if equalStrmRetryPaths(config.StrmPendingRetryPaths, normalizedRetryPaths) && config.StrmPendingRetryOverflow == retryOverflow && equalStrmParseFailureReports(config.StrmParseFailureReports, normalizedParseFailures) && config.StrmParseFailureOverflow == parseFailureOverflow {
+		return nil
+	}
+	config.StrmPendingRetryPaths = normalizedRetryPaths
+	config.StrmPendingRetryOverflow = retryOverflow
+	config.StrmParseFailureReports = normalizedParseFailures
+	config.StrmParseFailureOverflow = parseFailureOverflow
+	if err := saveConfigLocked(); err != nil {
+		config.StrmPendingRetryPaths = previousRetryPaths
+		config.StrmPendingRetryOverflow = previousRetryOverflow
+		config.StrmParseFailureReports = previousParseFailures
+		config.StrmParseFailureOverflow = previousParseFailureOverflow
+		return err
+	}
+	return nil
+}
+
+func persistStrmAppliedStateWithParseFailures(sign, baseURL, signEndpoint, token string, sourceHosts, retryPaths []string, retryOverflow bool, parseFailures []StrmParseFailure, parseFailureOverflow, replaceParseFailures bool) error {
 	if !md5SignPattern.MatchString(sign) {
 		return fmt.Errorf("签名无效")
 	}
@@ -1034,26 +1250,38 @@ func persistStrmAppliedState(sign, baseURL, signEndpoint, token string, sourceHo
 		normalizedRetryPaths = normalizedRetryPaths[:maxStrmPendingRetryPaths]
 		retryOverflow = true
 	}
+	normalizedParseFailures := normalizeStrmParseFailureReports(config.StrmParseFailureReports)
+	normalizedParseFailureOverflow := config.StrmParseFailureOverflow
+	if replaceParseFailures {
+		normalizedParseFailures = normalizeStrmParseFailureReports(parseFailures)
+		normalizedParseFailureOverflow = parseFailureOverflow
+	}
 	fingerprint, err := strmAppliedContentFingerprint(normalizedBaseURL, sign, normalizedHosts)
 	if err != nil {
 		return err
 	}
-	if config.StrmLastAppliedSign == sign && config.StrmLastAppliedFingerprint == fingerprint && equalStrmRetryPaths(config.StrmPendingRetryPaths, normalizedRetryPaths) && config.StrmPendingRetryOverflow == retryOverflow {
+	if config.StrmLastAppliedSign == sign && config.StrmLastAppliedFingerprint == fingerprint && equalStrmRetryPaths(config.StrmPendingRetryPaths, normalizedRetryPaths) && config.StrmPendingRetryOverflow == retryOverflow && equalStrmParseFailureReports(config.StrmParseFailureReports, normalizedParseFailures) && config.StrmParseFailureOverflow == normalizedParseFailureOverflow {
 		return nil
 	}
 	previous := config.StrmLastAppliedSign
 	previousFingerprint := config.StrmLastAppliedFingerprint
 	previousRetryPaths := append([]string(nil), config.StrmPendingRetryPaths...)
 	previousRetryOverflow := config.StrmPendingRetryOverflow
+	previousParseFailures := append([]StrmParseFailure(nil), config.StrmParseFailureReports...)
+	previousParseFailureOverflow := config.StrmParseFailureOverflow
 	config.StrmLastAppliedSign = sign
 	config.StrmLastAppliedFingerprint = fingerprint
 	config.StrmPendingRetryPaths = normalizedRetryPaths
 	config.StrmPendingRetryOverflow = retryOverflow
+	config.StrmParseFailureReports = normalizedParseFailures
+	config.StrmParseFailureOverflow = normalizedParseFailureOverflow
 	if err := saveConfigLocked(); err != nil {
 		config.StrmLastAppliedSign = previous
 		config.StrmLastAppliedFingerprint = previousFingerprint
 		config.StrmPendingRetryPaths = previousRetryPaths
 		config.StrmPendingRetryOverflow = previousRetryOverflow
+		config.StrmParseFailureReports = previousParseFailures
+		config.StrmParseFailureOverflow = previousParseFailureOverflow
 		return err
 	}
 	return nil
@@ -1088,6 +1316,56 @@ func normalizeStrmRetryPaths(paths []string) []string {
 		result = append(result, normalizedPath)
 	}
 	return result
+}
+
+func normalizeStrmParseFailureReports(reports []StrmParseFailure) []StrmParseFailure {
+	if len(reports) == 0 {
+		return nil
+	}
+	capacity := len(reports)
+	if capacity > maxStrmParseFailureReports {
+		capacity = maxStrmParseFailureReports
+	}
+	result := make([]StrmParseFailure, 0, capacity)
+	indexes := make(map[string]int, capacity)
+	for _, report := range reports {
+		paths := normalizeStrmRetryPaths([]string{report.Path})
+		if len(paths) != 1 {
+			continue
+		}
+		path := paths[0]
+		reason := strings.TrimSpace(report.Reason)
+		if reason == "" {
+			reason = "STRM 解析失败"
+		}
+		if index, exists := indexes[path]; exists {
+			result[index].Reason = reason
+			continue
+		}
+		if len(result) >= maxStrmParseFailureReports {
+			break
+		}
+		indexes[path] = len(result)
+		result = append(result, StrmParseFailure{Path: path, Reason: reason})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Path < result[j].Path
+	})
+	return result
+}
+
+func equalStrmParseFailureReports(left, right []StrmParseFailure) bool {
+	left = normalizeStrmParseFailureReports(left)
+	right = normalizeStrmParseFailureReports(right)
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func strmRetryRelativePath(mediaDir, path string) (string, error) {
@@ -1248,7 +1526,7 @@ func checkStrmSignAndScheduleRepair(mediaDir string) {
 		return
 	}
 	onSuccess := func(result StrmRewriteResult) error {
-		return persistStrmAppliedState(sign, baseURL, signEndpoint, resolvedToken, sourceHosts, result.RetryPaths, result.RetryOverflow)
+		return persistStrmAppliedStateFromResult(sign, baseURL, signEndpoint, resolvedToken, sourceHosts, result)
 	}
 	var started bool
 	if needsFullRepair {

@@ -441,19 +441,27 @@ async function saveStrmConfig() {
 function renderStrmRewriteStatus(data) {
     const statusElement = document.getElementById('strmRewriteStatus');
     const button = document.getElementById('rewriteExistingStrmBtn');
+    const parseButton = document.getElementById('rewriteParseFailuresBtn');
+    const downloadButton = document.getElementById('downloadParseFailuresBtn');
     if (!statusElement || !button) return;
     button.disabled = data.running;
+    const parseFailureCount = data.parseFailureCount || 0;
+    if (parseButton) parseButton.disabled = data.running || data.parseFailureOverflow || parseFailureCount === 0;
+    if (downloadButton) downloadButton.disabled = parseFailureCount === 0;
     const pendingRetryCount = data.pendingRetryCount || 0;
     const retryNotice = data.pendingRetryOverflow
         ? `；失败过多，需要手工全量修复（待记录 ${pendingRetryCount} 个）`
         : pendingRetryCount > 0 ? `；待重试 ${pendingRetryCount} 个` : '';
+    const parseNotice = data.parseFailureOverflow
+        ? `；解析失败报告已达到上限（待记录 ${parseFailureCount} 个），请先全量修复`
+        : parseFailureCount > 0 ? `；解析失败 ${parseFailureCount} 个` : '';
     if (data.running) {
-        statusElement.textContent = `运行中：已扫描 ${data.scanned}，更新 ${data.updated}，跳过 ${data.skipped}，失败 ${data.failed}${retryNotice}`;
+        statusElement.textContent = `运行中：已扫描 ${data.scanned}，更新 ${data.updated}，跳过 ${data.skipped}，失败 ${data.failed}${retryNotice}${parseNotice}`;
     } else if (data.pendingRetryOverflow) {
         statusElement.textContent = `失败过多，需要手工全量修复（待记录 ${pendingRetryCount} 个）`;
     } else if (data.finishedAt) {
         const error = data.lastError ? `；${data.lastError}` : '';
-        statusElement.textContent = `完成：扫描 ${data.scanned}，更新 ${data.updated}，跳过 ${data.skipped}，失败 ${data.failed}${error}${retryNotice}`;
+        statusElement.textContent = `完成：扫描 ${data.scanned}，更新 ${data.updated}，跳过 ${data.skipped}，失败 ${data.failed}${error}${retryNotice}${parseNotice}`;
     } else {
         statusElement.textContent = '未运行';
     }
@@ -479,6 +487,36 @@ async function rewriteExistingStrm() {
     } catch (error) {
         button.disabled = false;
         showStatus(`启动 STRM 修复失败: ${error.message}`, true);
+    }
+}
+
+async function rewriteStrmParseFailures() {
+    const button = document.getElementById('rewriteParseFailuresBtn');
+    if (button) button.disabled = true;
+    try {
+        await fetchAPI('/api/strm/rewrite-parse-failures', { method: 'POST' });
+        showStatus('已启动解析失败 STRM 定向修复任务');
+        await loadStrmRewriteStatus();
+    } catch (error) {
+        if (button) button.disabled = false;
+        showStatus(`启动解析失败 STRM 修复失败: ${error.message}`, true);
+    }
+}
+
+async function downloadStrmParseFailures() {
+    try {
+        const report = await fetchAPI('/api/strm/parse-failures');
+        const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'strm-parse-failures.json';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+    } catch (error) {
+        showStatus(`下载解析失败报告失败: ${error.message}`, true);
     }
 }
 

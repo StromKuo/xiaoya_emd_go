@@ -336,6 +336,207 @@ func TestHistoricalRepairContinuesAfterMalformedFile(t *testing.T) {
 	}
 }
 
+func TestHistoricalRepairRecordsParseFailureReport(t *testing.T) {
+	mediaDir := t.TempDir()
+	badPath := filepath.Join(mediaDir, "broken.strm")
+	if err := os.WriteFile(badPath, []byte("http://xiaoya.host:5678/d/video100%!.mp4"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldConfig := config
+	config = Config{StrmParseFailureReports: nil}
+	defer func() { config = oldConfig }()
+
+	result := runStrmRewriteWithSignResultAtGeneration(mediaDir, "http://new-host", testSign, []string{"xiaoya.host:5678"}, nil, 0)
+	if !result.Completed {
+		t.Fatal("解析失败文件不应使全量扫描失败")
+	}
+	if len(result.ParseFailureReports) != 1 {
+		t.Fatalf("解析失败报告数量 = %d, want 1", len(result.ParseFailureReports))
+	}
+	if result.ParseFailureReports[0].Path != "broken.strm" {
+		t.Fatalf("解析失败路径 = %q, want broken.strm", result.ParseFailureReports[0].Path)
+	}
+	if !strings.Contains(result.ParseFailureReports[0].Reason, "URL") {
+		t.Fatalf("解析失败原因 = %q", result.ParseFailureReports[0].Reason)
+	}
+}
+
+func TestParseFailureRepairTargetsReportOnly(t *testing.T) {
+	mediaDir := t.TempDir()
+	badPath := filepath.Join(mediaDir, "broken.strm")
+	otherPath := filepath.Join(mediaDir, "other.strm")
+	if err := os.WriteFile(badPath, []byte("http://xiaoya.host:5678/d/video100%!.mp4"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(otherPath, []byte("http://xiaoya.host:5678/d/other.mp4?sign=old\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldConfig := config
+	config = Config{StrmParseFailureReports: nil}
+	defer func() { config = oldConfig }()
+
+	first := runStrmRewriteWithSignResultAtGeneration(mediaDir, "http://new-host", testSign, []string{"xiaoya.host:5678"}, nil, 0)
+	if len(first.ParseFailureReports) != 1 {
+		t.Fatalf("首次解析失败报告 = %#v", first.ParseFailureReports)
+	}
+	config.StrmParseFailureReports = first.ParseFailureReports
+	if err := os.WriteFile(badPath, []byte("http://xiaoya.host:5678/d/video100%25!.mp4?sign=old\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	otherBefore, err := os.ReadFile(otherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second := runStrmParseFailureRewriteAtGeneration(mediaDir, "http://new-host", testSign, []string{"xiaoya.host:5678"}, first.ParseFailureReports, 0)
+	if !second.Completed || len(second.ParseFailureReports) != 0 {
+		t.Fatalf("定向解析失败修复结果 = %#v", second)
+	}
+	content, err := os.ReadFile(badPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "sign="+testSign) {
+		t.Fatalf("报告文件未被修复: %q", content)
+	}
+	otherAfter, err := os.ReadFile(otherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(otherAfter) != string(otherBefore) {
+		t.Fatalf("定向修复修改了报告外文件: before=%q after=%q", otherBefore, otherAfter)
+	}
+}
+
+func TestPersistStrmParseFailureReportsCaps(t *testing.T) {
+	mediaDir := t.TempDir()
+	mediaFlag := flag.Lookup("media")
+	oldMediaDir := ""
+	if mediaFlag == nil {
+		flag.String("media", mediaDir, "test media directory")
+	} else {
+		oldMediaDir = mediaFlag.Value.String()
+		if err := mediaFlag.Value.Set(mediaDir); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = mediaFlag.Value.Set(oldMediaDir) }()
+	}
+
+	oldConfig := config
+	config = Config{
+		StrmRewriteEnabled: true,
+		StrmBaseURL:        "http://new-host",
+		StrmSignEndpoint:   defaultStrmSignEndpoint,
+		StrmSignToken:      "test-token",
+		StrmSourceHosts:    []string{"xiaoya.host:5678"},
+	}
+	defer func() { config = oldConfig }()
+
+	reports := make([]StrmParseFailure, maxStrmParseFailureReports+1)
+	for i := range reports {
+		reports[i] = StrmParseFailure{
+			Path:   filepath.Join("nested", strconv.Itoa(i), "broken.strm"),
+			Reason: "STRM URL 解析失败",
+		}
+	}
+	result := StrmRewriteResult{
+		ParseFailureReports:     reports,
+		ParseFailureOverflow:    true,
+		ParseFailureReportReady: true,
+	}
+	if err := persistStrmAppliedStateFromResult(testSign, "http://new-host", defaultStrmSignEndpoint, "test-token", []string{"xiaoya.host:5678"}, result); err != nil {
+		t.Fatal(err)
+	}
+	if len(config.StrmParseFailureReports) != maxStrmParseFailureReports {
+		t.Fatalf("解析失败报告数量 = %d, want %d", len(config.StrmParseFailureReports), maxStrmParseFailureReports)
+	}
+	if !config.StrmParseFailureOverflow {
+		t.Fatal("解析失败报告超过上限时应保留溢出标记")
+	}
+}
+
+func TestPersistStrmStaleScanResultReplacesRetryPathsWithoutApplyingSign(t *testing.T) {
+	mediaDir := t.TempDir()
+	mediaFlag := flag.Lookup("media")
+	oldMediaDir := ""
+	if mediaFlag == nil {
+		flag.String("media", mediaDir, "test media directory")
+	} else {
+		oldMediaDir = mediaFlag.Value.String()
+		if err := mediaFlag.Value.Set(mediaDir); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = mediaFlag.Value.Set(oldMediaDir) }()
+	}
+
+	oldConfig := config
+	config = Config{
+		StrmRewriteEnabled:         true,
+		StrmBaseURL:                "http://new-host",
+		StrmSignEndpoint:           defaultStrmSignEndpoint,
+		StrmSignToken:              "test-token",
+		StrmSourceHosts:            []string{"xiaoya.host:5678"},
+		StrmLastAppliedSign:        "old-sign",
+		StrmLastAppliedFingerprint: "old-fingerprint",
+		StrmPendingRetryPaths:      []string{"already-fixed.strm"},
+		StrmParseFailureReports: []StrmParseFailure{{
+			Path:   "old-broken.strm",
+			Reason: "旧报告",
+		}},
+	}
+	defer func() { config = oldConfig }()
+
+	result := StrmRewriteResult{
+		RetryPaths: []string{"new-retry.strm"},
+		ParseFailureReports: []StrmParseFailure{{
+			Path:   "new-broken.strm",
+			Reason: "新报告",
+		}},
+		ParseFailureReportReady: true,
+	}
+	if err := persistStrmStaleScanResult("http://new-host", defaultStrmSignEndpoint, "test-token", []string{"xiaoya.host:5678"}, result); err != nil {
+		t.Fatal(err)
+	}
+	if config.StrmLastAppliedSign != "old-sign" || config.StrmLastAppliedFingerprint != "old-fingerprint" {
+		t.Fatalf("stale 扫描不应更新已应用签名状态: sign=%q fingerprint=%q", config.StrmLastAppliedSign, config.StrmLastAppliedFingerprint)
+	}
+	if !equalStrmRetryPaths(config.StrmPendingRetryPaths, []string{"new-retry.strm"}) {
+		t.Fatalf("stale 全量扫描应替换待重试路径: %#v", config.StrmPendingRetryPaths)
+	}
+	if !equalStrmParseFailureReports(config.StrmParseFailureReports, result.ParseFailureReports) {
+		t.Fatalf("stale 全量扫描应替换解析失败报告: %#v", config.StrmParseFailureReports)
+	}
+}
+
+func TestParseFailureReportEndpointReturnsPathsAndReasons(t *testing.T) {
+	oldConfig := config
+	config = Config{
+		StrmParseFailureReports: []StrmParseFailure{{
+			Path:   "nested/broken.strm",
+			Reason: "STRM URL 解析失败",
+		}},
+	}
+	defer func() { config = oldConfig }()
+
+	response := httptest.NewRecorder()
+	handleStrmParseFailures(response, httptest.NewRequest(http.MethodGet, "/api/strm/parse-failures", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, want %d", response.Code, http.StatusOK)
+	}
+	var report struct {
+		Count    int                `json:"count"`
+		Failures []StrmParseFailure `json:"failures"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Count != 1 || len(report.Failures) != 1 || report.Failures[0].Path != "nested/broken.strm" {
+		t.Fatalf("解析失败报告 = %#v", report)
+	}
+}
+
 func TestHistoricalRepairRetriesTransientFileFailuresOnly(t *testing.T) {
 	mediaDir := t.TempDir()
 	retryPath := filepath.Join(mediaDir, "retry.strm")
